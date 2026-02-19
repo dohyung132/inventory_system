@@ -1,23 +1,21 @@
 CC = gcc
 CFLAGS = -Wall -Iinclude
-# 최종 실행 파일 이름
-TARGET = bin/inventory_system
+BIN_DIR = bin
 
-# src 폴더 안의 모든 .c 파일을 재료로 사용하도록 수정
-SRCS = src/main.c src/server.c
-OBJS = $(SRCS:.c=.o)
+# 최종 타겟: 클라이언트와 서버 두 개를 만듭니다.
+all: $(BIN_DIR)/client $(BIN_DIR)/server
 
-all: $(TARGET)
+# 클라이언트 빌드
+$(BIN_DIR)/client: src/main.c
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ src/main.c
 
-$(TARGET): $(OBJS)
-	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
-
-# 개별 .c 파일을 .o 파일로 만드는 규칙
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+# 서버 빌드
+$(BIN_DIR)/server: src/server.c
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ src/server.c
 
 clean:
-	rm -f src/*.o $(TARGET)
+	rm -rf $(BIN_DIR)/*.o $(BIN_DIR)/client $(BIN_DIR)/server
 
 .PHONY: all clean
