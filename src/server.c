@@ -42,7 +42,10 @@ ssize_t send_exact(int sock, const void *buf, size_t len) {
     size_t total = 0; const char *p = (const char *)buf;
     while (total < len) {
         ssize_t n = send(sock, p + total, len - total, 0);
-        if (n <= 0) return -1; total += n;
+        if (n <= 0){
+
+         return -1; }
+         total += n;
     }
     return total;
 }
@@ -51,7 +54,10 @@ ssize_t recv_exact(int sock, void *buf, size_t len) {
     size_t total = 0; char *p = (char *)buf;
     while (total < len) {
         ssize_t n = recv(sock, p + total, len - total, 0);
-        if (n <= 0) return -1; total += n;
+        if (n <= 0) {
+            return -1; 
+        }
+        total += n;
     }
     return total;
 }
@@ -141,7 +147,9 @@ int make_detail_page(char* out, const char* name, int page, int mode) {
     for(Product* c = head; c; c = c->next) 
         if(strcmp(c->name, name)==0 && !(mode==1 && !c->is_expired)) total++;
     int items = 15; int tp = (total + items - 1) / items;
-    if(tp==0) tp=1; if(page<1) page=1; if(page>tp) page=tp;
+    if(tp==0) tp=1; 
+    if(page<1) page=1;
+    if(page>tp) page=tp;
     sprintf(out, "\n=== [%.40s] %s (페이지 %d/%d) ===\n", name, mode==1?"만료 목록":"상세 목록", page, tp);
     if(total > 0) {
         Product** arr = malloc(sizeof(Product*) * total); int idx = 0;
@@ -187,41 +195,89 @@ void* client_handler(void* socket_desc) {
                 }
             }
         }
-        else if(cmd == 2) { // 대량 랜덤 입고 (개선 버전)
+        else if(cmd == 2) { // 대량 랜덤 입고 (최적화 버전)
             int q = atoi(pin);
-            for(int i=0; i<q; i++) {
-                int r = rand()%10; char nid[20];
-                snprintf(nid, sizeof(nid), "%c_%04d", r_prefixes[r], ++r_counts[r]);
-                Product* n = malloc(sizeof(Product));
-                if(n) {
-                    strcpy(n->id, nid); strcpy(n->name, r_types[r]);
-                    n->expire_time = get_virtual_time() + ((rand()%96+1)*3600);
-                    n->is_expired = 0; n->next = head; head = n;
+            if (q > 0) {
+                Product* local_head = NULL;
+                Product* local_tail = NULL;
+                
+                for(int i=0; i<q; i++) {
+                    int r = rand()%10; char nid[20];
+                    snprintf(nid, sizeof(nid), "%c_%04d", r_prefixes[r], ++r_counts[r]);
+                    Product* n = malloc(sizeof(Product));
+                    if(n) {
+                        strcpy(n->id, nid); strcpy(n->name, r_types[r]);
+                        n->expire_time = get_virtual_time() + ((rand()%96+1)*3600);
+                        n->is_expired = 0;
+                        
+                        // 임시 리스트에 연결
+                        n->next = local_head;
+                        local_head = n;
+                        
+                        // 첫 노드를 꼬리로 지정
+                        if (local_tail == NULL) local_tail = n;
+                    }
                 }
+                
+                // 완성된 뭉치를 메인 리스트(head)에 한 번에 연결
+                if (local_tail != NULL) {
+                    local_tail->next = head;
+                    head = local_head;
+                }
+                
+                save_data(); 
+                snprintf(msg, sizeof(msg), "✅ 랜덤 %d개 입고 완료", q);
             }
-            save_data(); snprintf(msg, sizeof(msg), "✅ 랜덤 %d개 입고 완료", q);
         }
         else if(cmd == 7) make_category_summary(msg, 0, "전체 재고 요약");
         else if(cmd == 10) make_category_summary(msg, 1, "만료 재고 요약");
         else if(cmd == 15) make_category_summary(msg, 2, "판매 가능 메뉴판");
         else if(cmd == 9) { char* n=strtok(pin,"|"); char* p=strtok(NULL,"|"); if(n&&p) out_p=make_detail_page(msg, n, atoi(p), 0); }
         else if(cmd == 11) { char* n=strtok(pin,"|"); char* p=strtok(NULL,"|"); if(n&&p) out_p=make_detail_page(msg, n, atoi(p), 1); }
-        else if(cmd == 14) { // 판매 (FIFO)
-            char name[50]; int qty, total=0; sscanf(pin, "%49[^|]|%d", name, &qty);
-            for(Product* c=head; c; c=c->next) if(strcmp(c->name, name)==0 && !c->is_expired) total++;
-            if(total < qty) snprintf(msg, sizeof(msg), "❌ 재고 부족 (현재: %d)", total);
+        else if(cmd == 14) { // 판매 (FIFO) - 부분 판매 지원
+            char name[50]; int req_qty, total=0; 
+            sscanf(pin, "%49[^|]|%d", name, &req_qty);
+            
+            // 1. 현재 정상 재고 개수 파악
+            for(Product* c=head; c; c=c->next) {
+                if(strcmp(c->name, name)==0 && !c->is_expired) total++;
+            }
+            
+            // 2. 재고가 아예 없으면 실패
+            if(total == 0) {
+                snprintf(msg, sizeof(msg), "❌ 재고 없음 (판매 불가)");
+            } 
+            // 3. 재고가 1개라도 있으면 있는 만큼(actual_qty) 판매 진행
             else {
+                int actual_qty = (total < req_qty) ? total : req_qty;
+                
                 Product** arr = malloc(sizeof(Product*)*total); int idx=0;
-                for(Product* c=head; c; c=c->next) if(strcmp(c->name, name)==0 && !c->is_expired) arr[idx++]=c;
+                for(Product* c=head; c; c=c->next) {
+                    if(strcmp(c->name, name)==0 && !c->is_expired) arr[idx++]=c;
+                }
+                
                 qsort(arr, total, sizeof(Product*), compare_products);
-                for(int i=0; i<qty; i++) {
+                
+                for(int i=0; i<actual_qty; i++) {
                     Product *t=arr[i], *cur=head, *prev=NULL;
                     while(cur) {
-                        if(cur==t) { if(!prev) head=cur->next; else prev->next=cur->next; free(cur); break; }
+                        if(cur==t) { 
+                            if(!prev) head=cur->next; 
+                            else prev->next=cur->next; 
+                            free(cur); 
+                            break; 
+                        }
                         prev=cur; cur=cur->next;
                     }
                 }
-                free(arr); save_data(); snprintf(msg, sizeof(msg), "✅ %.40s %d개 판매 완료", name, qty);
+                free(arr); save_data(); 
+                
+                // 4. 결과 메시지 차별화 (전부 팔았을 때 vs 있는 것만 팔았을 때)
+                if (actual_qty < req_qty) {
+                    snprintf(msg, sizeof(msg), "⚠️ 부분 판매: %.40s %d개 (요청 %d개 중 재고 부족)", name, actual_qty, req_qty);
+                } else {
+                    snprintf(msg, sizeof(msg), "✅ %.40s %d개 판매 완료", name, actual_qty);
+                }
             }
         }
         else if(cmd == 16) { 
@@ -272,12 +328,26 @@ void* client_handler(void* socket_desc) {
 void* monitor_thread(void* arg) {
     while(1) {
         time_t vt = get_virtual_time();
+        char time_str[26];
+        print_time_str(vt, time_str);
+
+        // [추가] 서버 터미널에 현재 가상 시간을 계속 출력 (확인용)
+        printf("\r[Virtual Time] %s (Speed: x%d)", time_str, SPEED_FACTOR);
+        fflush(stdout);
+
         pthread_mutex_lock(&list_mutex);
         int ch = 0;
-        for(Product* c = head; c; c = c->next) if(!c->is_expired && c->expire_time < vt) { c->is_expired = 1; ch = 1; }
+        for(Product* c = head; c; c = c->next) {
+            if(!c->is_expired && c->expire_time < vt) { 
+                c->is_expired = 1; 
+                ch = 1; 
+                printf("\n[System] 상품 만료 발생: [%s] %s\n", c->id, c->name);
+            }
+        }
         if(ch) save_data();
         pthread_mutex_unlock(&list_mutex);
-        usleep(500000);
+        
+        usleep(1000000); // 1초마다 갱신
     }
 }
 
