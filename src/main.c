@@ -266,9 +266,12 @@ int main(int argc, char *argv[]) {
             printf("몇 개의 랜덤 상품을 입고하시겠습니까?: ");
             get_safe_input(input_buf, sizeof(input_buf));
             int qty;
-            if (!parse_int(input_buf, &qty) || qty <= 0 || qty > 1000) {
-                printf("[오류] 1개에서 1000개 사이로 입력해주세요.\n"); pause_screen(); continue;
-            }
+           if (!parse_int(input_buf, &qty) || qty <= 0 || qty > 500000) {
+            printf("[오류] 1개에서 50000개 사이로 입력해주세요.\n"); 
+             pause_screen(); 
+            continue;
+             }
+
 
             snprintf(req_payload, sizeof(req_payload), "%d", qty);
             if (request_server(sock, 2, req_payload, res_payload, &pages) < 0) break;
