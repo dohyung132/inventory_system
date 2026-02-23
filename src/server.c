@@ -406,28 +406,49 @@ void* client_handler(void* socket_desc) {
         else if(cmd == 9) { char* n=strtok(pin,"|"); char* p=strtok(NULL,"|"); if(n&&p) out_p=make_detail_page(msg, n, atoi(p), 0); }
         else if(cmd == 11) { char* n=strtok(pin,"|"); char* p=strtok(NULL,"|"); if(n&&p) out_p=make_detail_page(msg, n, atoi(p), 1); }
         else if(cmd == 14) { 
-            char name[50]; int req_qty, total=0; 
+            char name[50]; int req_qty, total = 0; 
             sscanf(pin, "%49[^|]|%d", name, &req_qty);
-            for(Product* c=head; c; c=c->next) if(strcmp(c->name, name)==0 && !c->is_expired) total++;
             
-            if(total == 0) snprintf(msg, sizeof(msg), "[오류] 재고 없음");
+            // 1. 판매 가능한(미만료) 해당 상품의 전체 수량 파악
+            for(Product* c = head; c; c = c->next) {
+                if(strcmp(c->name, name) == 0 && !c->is_expired) total++;
+            }
+            
+            if(total == 0) {
+                snprintf(msg, sizeof(msg), "[실패] %s 재고 없음", name);
+            }
             else {
+                // [복구 로직] 요청 수량보다 재고가 적으면 있는 만큼만 판매
                 int actual_qty = (total < req_qty) ? total : req_qty;
-                Product** arr = malloc(sizeof(Product*)*total); int idx=0;
-                for(Product* c=head; c; c=c->next) if(strcmp(c->name, name)==0 && !c->is_expired) arr[idx++]=c;
+                
+                // 유통기한이 짧은 것부터 팔기 위해 배열에 담아 정렬
+                Product** arr = malloc(sizeof(Product*) * total); 
+                int idx = 0;
+                for(Product* c = head; c; c = c->next) {
+                    if(strcmp(c->name, name) == 0 && !c->is_expired) arr[idx++] = c;
+                }
                 qsort(arr, total, sizeof(Product*), compare_products);
-                for(int i=0; i<actual_qty; i++) {
-                    Product *t=arr[i], *cur=head, *prev=NULL;
+                
+                // 실제 판매 처리 (리스트에서 제거)
+                for(int i = 0; i < actual_qty; i++) {
+                    Product *t = arr[i], *cur = head, *prev = NULL;
                     while(cur) {
-                        if(cur==t) { 
-                            if(!prev) head=cur->next; else prev->next=cur->next; 
+                        if(cur == t) { 
+                            if(!prev) head = cur->next; else prev->next = cur->next; 
                             free(cur); break; 
                         }
-                        prev=cur; cur=cur->next;
+                        prev = cur; cur = cur->next;
                     }
                 }
-                free(arr); save_data(); 
-                snprintf(msg, sizeof(msg), "[판매] %s %d개 결제", name, actual_qty);
+                free(arr);
+                save_data(); 
+
+                // [복구 메시지] 재고가 부족했던 경우 안내 문구 추가
+                if (total < req_qty) {
+                    snprintf(msg, sizeof(msg), "[부분판매] %s 부족으로 %d개만 결제됨 (요청:%d)", name, actual_qty, req_qty);
+                } else {
+                    snprintf(msg, sizeof(msg), "[판매완료] %s %d개 결제", name, actual_qty);
+                }
                 update_log(msg); 
             }
         }
