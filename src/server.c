@@ -71,25 +71,46 @@ void print_time_str(time_t t, char* buf) {
    로그 및 설정 관리
    ========================================== */
 
+/* ==========================================
+   로그 기록 및 업데이트 (날짜 포함 버전)
+   ========================================== */
 void update_log(const char* msg) {
+    // 1. 가상 시간 가져오기 및 포맷팅
     time_t vt = get_virtual_time(); 
-    struct tm tm_info; localtime_r(&vt, &tm_info);
-    char t_str[26]; strftime(t_str, 26, "%H:%M:%S", &tm_info);
+    struct tm tm_info; 
+    localtime_r(&vt, &tm_info);
     
+    // 날짜와 시간을 모두 담기 위해 버퍼 크기를 넉넉히 잡습니다.
+    char t_str[32]; 
+    // %Y-%m-%d: 연-월-일, %H:%M:%S: 시:분:초
+    strftime(t_str, sizeof(t_str), "%Y-%m-%d %H:%M:%S", &tm_info);
+    
+    // 전체 로그 메시지 생성 (날짜 + 메시지)
     char formatted_msg[1024];
+    // %.800s를 사용하여 메시지가 너무 길어 버퍼가 넘치는 것을 방지합니다.
     snprintf(formatted_msg, sizeof(formatted_msg), "[%s] %.800s", t_str, msg); 
 
+    // 2. 로그 데이터 보호를 위해 뮤텍스 잠금
     pthread_mutex_lock(&log_mutex);
     
+    // 3. 파일(server.log)에 영구 저장 (추가 모드 'a')
     FILE *fp = fopen(LOG_FILE, "a");
-    if (fp) { fprintf(fp, "%s\n", formatted_msg); fclose(fp); }
+    if (fp) { 
+        fprintf(fp, "%s\n", formatted_msg); 
+        fclose(fp); 
+    }
 
+    // 4. 메인 화면용 최근 로그 업데이트
     strncpy(last_log, formatted_msg, sizeof(last_log) - 1);
+
+    // 5. 링 버퍼(log_history)에 저장 (페이징 및 대시보드 출력용)
     strncpy(log_history[log_head], formatted_msg, sizeof(log_history[0]) - 1);
     
+    // 다음 로그가 저장될 위치 계산 (순환 구조)
     log_head = (log_head + 1) % MAX_HISTORY;
     total_logs++;
     
+    // 6. 잠금 해제
     pthread_mutex_unlock(&log_mutex);
 }
 
