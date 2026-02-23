@@ -8,69 +8,210 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <stdint.h>
+#include <errno.h>
 
 #define PORT 8080
-#define SPEED_FACTOR 360  
 #define MAX_PAYLOAD 8192
 
-// [TLV 통신 헤더]
-typedef struct {
-    uint32_t code;   
-    uint32_t length; 
-} NetHeader;
+// [설정 상수]
+#define MAX_HISTORY 1000      
+#define DASHBOARD_LOGS 15     
+#define CONFIG_FILE "server_config.txt"
+#define LOG_FILE "server.log"
+
+// [전역 변수]
+int server_mode = 0;        
+int speed_factor = 1;       
+int show_clock = 1;         
+time_t start_real_time;
+time_t start_virtual_time;
+char db_filename[50];       
+
+// [화면 상태 제어 변수]
+char log_history[MAX_HISTORY][1024]; 
+int log_head = 0; 
+int total_logs = 0;
+char last_log[1024] = "서버 대기 중...";
+int is_browsing_log = 0; 
+
+// [동기화 뮤텍스]
+pthread_mutex_t list_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER; 
+pthread_mutex_t screen_mutex = PTHREAD_MUTEX_INITIALIZER; 
+
+// [구조체 정의]
+typedef struct { uint32_t code; uint32_t length; } NetHeader;
 
 typedef struct Product {
-    char id[20];
-    char name[50];
-    time_t expire_time;
-    int is_expired;         
+    char id[20]; char name[50]; time_t expire_time; int is_expired;
     struct Product* next;
 } Product;
 
 Product* head = NULL;
-pthread_mutex_t list_mutex;
-time_t start_real_time;
-time_t start_virtual_time;
 
 char r_types[10][50] = {"김밥", "샌드위치", "우유", "도시락", "컵라면", "콜라", "생수", "과자", "아이스크림", "커피"};
 char r_prefixes[10] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'};
 int r_counts[10] = {0}; 
 
-/* --- 유틸리티 및 네트워크 보장 함수 --- */
-
-ssize_t send_exact(int sock, const void *buf, size_t len) {
-    size_t total = 0; const char *p = (const char *)buf;
-    while (total < len) {
-        ssize_t n = send(sock, p + total, len - total, 0);
-        if (n <= 0){
-
-         return -1; }
-         total += n;
-    }
-    return total;
-}
-
-ssize_t recv_exact(int sock, void *buf, size_t len) {
-    size_t total = 0; char *p = (char *)buf;
-    while (total < len) {
-        ssize_t n = recv(sock, p + total, len - total, 0);
-        if (n <= 0) {
-            return -1; 
-        }
-        total += n;
-    }
-    return total;
-}
+/* ==========================================
+   시간 및 유틸리티
+   ========================================== */
 
 time_t get_virtual_time() {
     time_t now; time(&now);
-    return start_virtual_time + (time_t)(difftime(now, start_real_time) * SPEED_FACTOR);
+    return start_virtual_time + (time_t)(difftime(now, start_real_time) * speed_factor);
 }
 
 void print_time_str(time_t t, char* buf) {
     struct tm tm_info; localtime_r(&t, &tm_info);
     strftime(buf, 26, "%Y-%m-%d %H:%M:%S", &tm_info);
 }
+
+/* ==========================================
+   로그 및 설정 관리
+   ========================================== */
+
+void update_log(const char* msg) {
+    time_t vt = get_virtual_time(); 
+    struct tm tm_info; localtime_r(&vt, &tm_info);
+    char t_str[26]; strftime(t_str, 26, "%H:%M:%S", &tm_info);
+    
+    char formatted_msg[1024];
+    snprintf(formatted_msg, sizeof(formatted_msg), "[%s] %.800s", t_str, msg); 
+
+    pthread_mutex_lock(&log_mutex);
+    
+    FILE *fp = fopen(LOG_FILE, "a");
+    if (fp) { fprintf(fp, "%s\n", formatted_msg); fclose(fp); }
+
+    strncpy(last_log, formatted_msg, sizeof(last_log) - 1);
+    strncpy(log_history[log_head], formatted_msg, sizeof(log_history[0]) - 1);
+    
+    log_head = (log_head + 1) % MAX_HISTORY;
+    total_logs++;
+    
+    pthread_mutex_unlock(&log_mutex);
+}
+
+void load_persistent_logs() {
+    FILE *fp = fopen(LOG_FILE, "r");
+    if (!fp) return;
+
+    char line[1024];
+    pthread_mutex_lock(&log_mutex);
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = 0;
+        strncpy(log_history[log_head], line, sizeof(log_history[0]) - 1);
+        log_head = (log_head + 1) % MAX_HISTORY;
+        total_logs++;
+        strncpy(last_log, line, sizeof(last_log) - 1); 
+    }
+    pthread_mutex_unlock(&log_mutex);
+    fclose(fp);
+}
+
+void clear_persistent_logs() {
+    pthread_mutex_lock(&log_mutex);
+    FILE *fp = fopen(LOG_FILE, "w"); 
+    if (fp) fclose(fp);
+    
+    for(int i = 0; i < MAX_HISTORY; i++) strcpy(log_history[i], "");
+    log_head = 0;
+    total_logs = 0;
+    strcpy(last_log, "로그 초기화됨.");
+    pthread_mutex_unlock(&log_mutex);
+    
+    update_log("[Clear] 로그 파일 및 내역이 초기화되었습니다.");
+}
+
+void save_config() {
+    if (server_mode != 2) return; 
+    FILE *fp = fopen(CONFIG_FILE, "w");
+    if (!fp) return;
+    
+    time_t now; time(&now);
+    time_t current_vt = get_virtual_time();
+    fprintf(fp, "%d %ld %ld\n", speed_factor, (long)current_vt, (long)now);
+    fclose(fp);
+}
+
+void load_config() {
+    if (server_mode != 2) return;
+
+    FILE *fp = fopen(CONFIG_FILE, "r");
+    if (!fp) { speed_factor = 1; return; }
+
+    int saved_speed;
+    long saved_vt, saved_rt;
+    if (fscanf(fp, "%d %ld %ld", &saved_speed, &saved_vt, &saved_rt) == 3) {
+        speed_factor = saved_speed;
+        time_t now; time(&now);
+        time_t time_diff = now - (time_t)saved_rt; 
+        time_t resumed_vt = (time_t)saved_vt + (time_diff * speed_factor);
+        
+        start_real_time = now;
+        start_virtual_time = resumed_vt;
+
+        char msg[256];
+        snprintf(msg, sizeof(msg), "[System] 세션 복구 완료 (%ld초 흐름, 배속: x%d)", time_diff, speed_factor);
+        update_log(msg);
+    }
+    fclose(fp);
+}
+
+/* ==========================================
+   [핵심 해결!] 화면 그리기 (개행 문자 완전 제거)
+   ========================================== */
+
+void draw_dashboard(const char* time_str) {
+    if (!show_clock || is_browsing_log) return; 
+
+    pthread_mutex_lock(&screen_mutex); 
+
+    printf("\033[s");   // 커서 저장
+
+    // [수정] \n을 전부 지우고 절대 좌표로만 이동하도록 완벽 수정
+    printf("\033[1;1H\033[2K========================================================================");
+    
+    if (server_mode == 2)
+        printf("\033[2;1H\033[2K [SIMULATION] 배속: x%-5d | DB: %-20s", speed_factor, db_filename);
+    else
+        printf("\033[2;1H\033[2K [OPERATION] 실시간 동작 (1배속) | DB: %-20s", db_filename);
+    
+    printf("\033[3;1H\033[2K========================================================================");
+    printf("\033[4;1H\033[2K [Time] %s", time_str);
+    printf("\033[5;1H\033[2K------------------------------------------------------------------------");
+
+    // 로그 출력부 (역시 \n 완전 제거)
+    pthread_mutex_lock(&log_mutex);
+    int count = (total_logs < DASHBOARD_LOGS) ? total_logs : DASHBOARD_LOGS;
+
+    for (int i = 0; i < DASHBOARD_LOGS; i++) {
+        if (i < count) {
+            int idx = (log_head - count + i + MAX_HISTORY) % MAX_HISTORY;
+            printf("\033[%d;1H\033[2K %s", 6 + i, log_history[idx]); 
+        } else {
+            printf("\033[%d;1H\033[2K", 6 + i); // 빈 줄도 명확하게 좌표로 지우기만 함
+        }
+    }
+    pthread_mutex_unlock(&log_mutex);
+
+    printf("\033[%d;1H\033[2K------------------------------------------------------------------------", 6 + DASHBOARD_LOGS);
+
+    if (server_mode == 2) 
+        printf("\033[%d;1H\033[2K 👉 명령: reset / clearlog / log / speed <N> / stop / start / exit", 7 + DASHBOARD_LOGS);
+    else 
+        printf("\033[%d;1H\033[2K 👉 명령: log / exit", 7 + DASHBOARD_LOGS);
+    
+    printf("\033[u");   // 커서 복구
+    
+    fflush(stdout);     // 출력 밀어내기
+    pthread_mutex_unlock(&screen_mutex); 
+}
+
+/* ==========================================
+   데이터 관리 및 비즈니스 로직
+   ========================================== */
 
 int compare_products(const void* a, const void* b) {
     Product* p1 = *(Product**)a; Product* p2 = *(Product**)b;
@@ -82,27 +223,46 @@ int is_id_exists(char* id) {
     return 0;
 }
 
-/* --- 자원 관리 및 영속성 --- */
+ssize_t send_exact(int sock, const void *buf, size_t len) {
+    size_t total = 0; const char *p = (const char *)buf;
+    while (total < len) {
+        ssize_t n = send(sock, p + total, len - total, 0);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return total;
+}
+
+ssize_t recv_exact(int sock, void *buf, size_t len) {
+    size_t total = 0; char *p = (char *)buf;
+    while (total < len) {
+        ssize_t n = recv(sock, p + total, len - total, 0);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return total;
+}
 
 void save_data() {
-    FILE *fp = fopen("inventory_data.txt", "w");
+    FILE *fp = fopen(db_filename, "w");
     if (!fp) return;
     for(Product* c = head; c; c = c->next)
         fprintf(fp, "%s %s %ld %d\n", c->id, c->name, (long)c->expire_time, c->is_expired);
     fclose(fp);
+    save_config(); 
 }
 
 void free_all_resources() {
-    pthread_mutex_lock(&list_mutex);
     Product* cur = head;
     while(cur) { Product* next = cur->next; free(cur); cur = next; }
     head = NULL;
-    pthread_mutex_unlock(&list_mutex);
+    for(int i=0; i<10; i++) r_counts[i] = 0;
 }
 
 void load_data() {
-    FILE *fp = fopen("inventory_data.txt", "r");
-    if (!fp) return;
+    FILE *fp = fopen(db_filename, "r");
+    if (!fp) { update_log("[System] 새로운 데이터베이스 생성"); return; }
+    
     char id[20], name[50]; long et; int ie; int cnt = 0;
     while(fscanf(fp, "%s %s %ld %d", id, name, &et, &ie) == 4) {
         Product* n = malloc(sizeof(Product));
@@ -115,16 +275,16 @@ void load_data() {
         }
     }
     fclose(fp);
-    printf("[System] 데이터 %d개 로드 완료\n", cnt);
+    char buf[100]; snprintf(buf, sizeof(buf), "[System] 기존 데이터 %d개 로드됨", cnt);
+    update_log(buf);
 }
 
 void handle_sigint(int sig) {
-    printf("\n[System] 종료 중... 자원 정리 실시\n");
+    printf("\033[?25h"); 
+    printf("\n\n[System] 데이터 저장 및 서버 종료 중...\n");
     pthread_mutex_lock(&list_mutex); save_data(); pthread_mutex_unlock(&list_mutex);
     free_all_resources(); exit(0);
 }
-
-/* --- 공통 비즈니스 로직 --- */
 
 void make_category_summary(char* out, int mode, const char* title) {
     typedef struct { char name[50]; int count; } Cat;
@@ -147,9 +307,11 @@ int make_detail_page(char* out, const char* name, int page, int mode) {
     for(Product* c = head; c; c = c->next) 
         if(strcmp(c->name, name)==0 && !(mode==1 && !c->is_expired)) total++;
     int items = 15; int tp = (total + items - 1) / items;
-    if(tp==0) tp=1; 
-    if(page<1) page=1;
-    if(page>tp) page=tp;
+    
+    if(tp == 0) tp = 1; 
+    if(page < 1) page = 1; 
+    if(page > tp) page = tp;
+
     sprintf(out, "\n=== [%.40s] %s (페이지 %d/%d) ===\n", name, mode==1?"만료 목록":"상세 목록", page, tp);
     if(total > 0) {
         Product** arr = malloc(sizeof(Product*) * total); int idx = 0;
@@ -167,40 +329,38 @@ int make_detail_page(char* out, const char* name, int page, int mode) {
     return tp;
 }
 
-/* --- 클라이언트 핸들러 --- */
-
 void* client_handler(void* socket_desc) {
     int sock = *(int*)socket_desc; free(socket_desc);
     NetHeader req, res;
-    char pin[MAX_PAYLOAD], pout[MAX_PAYLOAD], msg[MAX_PAYLOAD];
+    char pin[MAX_PAYLOAD], pout[MAX_PAYLOAD + 512], msg[MAX_PAYLOAD + 256];
 
     while (recv_exact(sock, &req, sizeof(NetHeader)) > 0) {
         uint32_t cmd = ntohl(req.code), len = ntohl(req.length);
         if(len > 0) recv_exact(sock, pin, (len < MAX_PAYLOAD)? len : MAX_PAYLOAD-1);
         pin[len] = '\0'; msg[0] = '\0';
+        
         pthread_mutex_lock(&list_mutex);
         int out_p = 0;
 
-        if(cmd == 1) { // 수동 입고
+        if(cmd == 1) { 
             char id[20], name[50]; int h;
             if(sscanf(pin, "%19[^|]|%49[^|]|%d", id, name, &h) == 3) {
-                if(is_id_exists(id)) snprintf(msg, sizeof(msg), "❌ 중복 ID: %.20s", id);
+                if(is_id_exists(id)) snprintf(msg, sizeof(msg), "[오류] 중복 ID: %s", id);
                 else {
                     Product* n = malloc(sizeof(Product));
                     strncpy(n->id, id, 19); n->id[19] = '\0';
                     strncpy(n->name, name, 49); n->name[49] = '\0';
                     n->expire_time = get_virtual_time() + (h*3600); n->is_expired = 0;
                     n->next = head; head = n; save_data();
-                    snprintf(msg, sizeof(msg), "✅ 입고 완료: %.20s", id);
+                    snprintf(msg, sizeof(msg), "[입고] %s", id);
+                    update_log(msg); 
                 }
             }
         }
-        else if(cmd == 2) { // 대량 랜덤 입고 (최적화 버전)
+        else if(cmd == 2) { 
             int q = atoi(pin);
             if (q > 0) {
-                Product* local_head = NULL;
-                Product* local_tail = NULL;
-                
+                Product* local_head = NULL, *local_tail = NULL;
                 for(int i=0; i<q; i++) {
                     int r = rand()%10; char nid[20];
                     snprintf(nid, sizeof(nid), "%c_%04d", r_prefixes[r], ++r_counts[r]);
@@ -209,24 +369,14 @@ void* client_handler(void* socket_desc) {
                         strcpy(n->id, nid); strcpy(n->name, r_types[r]);
                         n->expire_time = get_virtual_time() + ((rand()%96+1)*3600);
                         n->is_expired = 0;
-                        
-                        // 임시 리스트에 연결
-                        n->next = local_head;
-                        local_head = n;
-                        
-                        // 첫 노드를 꼬리로 지정
+                        n->next = local_head; local_head = n;
                         if (local_tail == NULL) local_tail = n;
                     }
                 }
-                
-                // 완성된 뭉치를 메인 리스트(head)에 한 번에 연결
-                if (local_tail != NULL) {
-                    local_tail->next = head;
-                    head = local_head;
-                }
-                
+                if (local_tail != NULL) { local_tail->next = head; head = local_head; }
                 save_data(); 
-                snprintf(msg, sizeof(msg), "✅ 랜덤 %d개 입고 완료", q);
+                snprintf(msg, sizeof(msg), "[입고] 랜덤 상품 %d개 완료", q);
+                update_log(msg); 
             }
         }
         else if(cmd == 7) make_category_summary(msg, 0, "전체 재고 요약");
@@ -234,90 +384,73 @@ void* client_handler(void* socket_desc) {
         else if(cmd == 15) make_category_summary(msg, 2, "판매 가능 메뉴판");
         else if(cmd == 9) { char* n=strtok(pin,"|"); char* p=strtok(NULL,"|"); if(n&&p) out_p=make_detail_page(msg, n, atoi(p), 0); }
         else if(cmd == 11) { char* n=strtok(pin,"|"); char* p=strtok(NULL,"|"); if(n&&p) out_p=make_detail_page(msg, n, atoi(p), 1); }
-        else if(cmd == 14) { // 판매 (FIFO) - 부분 판매 지원
+        else if(cmd == 14) { 
             char name[50]; int req_qty, total=0; 
             sscanf(pin, "%49[^|]|%d", name, &req_qty);
+            for(Product* c=head; c; c=c->next) if(strcmp(c->name, name)==0 && !c->is_expired) total++;
             
-            // 1. 현재 정상 재고 개수 파악
-            for(Product* c=head; c; c=c->next) {
-                if(strcmp(c->name, name)==0 && !c->is_expired) total++;
-            }
-            
-            // 2. 재고가 아예 없으면 실패
-            if(total == 0) {
-                snprintf(msg, sizeof(msg), "❌ 재고 없음 (판매 불가)");
-            } 
-            // 3. 재고가 1개라도 있으면 있는 만큼(actual_qty) 판매 진행
+            if(total == 0) snprintf(msg, sizeof(msg), "[오류] 재고 없음");
             else {
                 int actual_qty = (total < req_qty) ? total : req_qty;
-                
                 Product** arr = malloc(sizeof(Product*)*total); int idx=0;
-                for(Product* c=head; c; c=c->next) {
-                    if(strcmp(c->name, name)==0 && !c->is_expired) arr[idx++]=c;
-                }
-                
+                for(Product* c=head; c; c=c->next) if(strcmp(c->name, name)==0 && !c->is_expired) arr[idx++]=c;
                 qsort(arr, total, sizeof(Product*), compare_products);
-                
                 for(int i=0; i<actual_qty; i++) {
                     Product *t=arr[i], *cur=head, *prev=NULL;
                     while(cur) {
                         if(cur==t) { 
-                            if(!prev) head=cur->next; 
-                            else prev->next=cur->next; 
-                            free(cur); 
-                            break; 
+                            if(!prev) head=cur->next; else prev->next=cur->next; 
+                            free(cur); break; 
                         }
                         prev=cur; cur=cur->next;
                     }
                 }
                 free(arr); save_data(); 
-                
-                // 4. 결과 메시지 차별화 (전부 팔았을 때 vs 있는 것만 팔았을 때)
-                if (actual_qty < req_qty) {
-                    snprintf(msg, sizeof(msg), "⚠️ 부분 판매: %.40s %d개 (요청 %d개 중 재고 부족)", name, actual_qty, req_qty);
-                } else {
-                    snprintf(msg, sizeof(msg), "✅ %.40s %d개 판매 완료", name, actual_qty);
-                }
+                snprintf(msg, sizeof(msg), "[판매] %s %d개 결제", name, actual_qty);
+                update_log(msg); 
             }
         }
         else if(cmd == 16) { 
-            pthread_mutex_unlock(&list_mutex); free_all_resources(); pthread_mutex_lock(&list_mutex);
-            for(int i=0; i<10; i++) r_counts[i]=0;
-            strcpy(msg, "🔥 창고 전체 초기화 완료"); save_data();
+            free_all_resources(); remove(db_filename);
+            strcpy(msg, "[초기화] 클라이언트에서 창고 비움"); 
+            update_log(msg); 
         }
-        else if(cmd == 12 || cmd == 13) { 
-            Product *cur=head, *prev=NULL; int d=0;
-            while(cur) {
-                if(strcmp(cur->name, pin)==0 && (cmd==12 || cur->is_expired)) {
-                    Product* t=cur; if(!prev) head=cur->next; else prev->next=cur->next;
-                    cur=cur->next; free(t); d++;
-                } else { prev=cur; cur=cur->next; }
-            }
-            snprintf(msg, sizeof(msg), "✅ %.40s %d개 삭제", pin, d); save_data();
-        }
-        else if(cmd == 8 || cmd == 6) { 
-            Product *cur=head, *prev=NULL; int f=0;
-            while(cur) {
-                if(strcmp(cur->id, pin)==0) {
-                    if(cmd==6 && !cur->is_expired) strcpy(msg, "❌ 미만료 상품");
-                    else { if(!prev) head=cur->next; else prev->next=cur->next; free(cur); strcpy(msg, "✅ 삭제 완료"); save_data(); }
-                    f=1; break;
+        else if(cmd == 12 || cmd == 13 || cmd == 8 || cmd == 6 || cmd == 5) {
+             Product *cur=head, *prev=NULL; int d=0; int f=0;
+             if (cmd == 5) {
+                while(cur) {
+                    if(cur->is_expired) { Product* t=cur; if(!prev) head=cur->next; else prev->next=cur->next; cur=cur->next; free(t); d++; }
+                    else { prev=cur; cur=cur->next; }
                 }
-                prev=cur; cur=cur->next;
-            }
-            if(!f) strcpy(msg, "❌ ID 없음");
-        }
-        else if(cmd == 5) { 
-            Product *cur=head, *prev=NULL; int d=0;
-            while(cur) {
-                if(cur->is_expired) { Product* t=cur; if(!prev) head=cur->next; else prev->next=cur->next; cur=cur->next; free(t); d++; }
-                else { prev=cur; cur=cur->next; }
-            }
-            snprintf(msg, sizeof(msg), "✅ 만료 상품 %d개 삭제", d); save_data();
+                snprintf(msg, sizeof(msg), "[삭제] 만료 상품 %d개 일괄 폐기", d);
+                save_data(); update_log(msg);
+             } else if (cmd == 8 || cmd == 6) {
+                while(cur) {
+                    if(strcmp(cur->id, pin)==0) {
+                        if(cmd==6 && !cur->is_expired) strcpy(msg, "[실패] 미만료 상품");
+                        else { 
+                            if(!prev) head=cur->next; else prev->next=cur->next; free(cur); 
+                            snprintf(msg, sizeof(msg), "[삭제] 상품명: %.100s 완료", pin); 
+                            save_data(); update_log(msg); 
+                        }
+                        f=1; break;
+                    }
+                    prev=cur; cur=cur->next;
+                }
+                if(!f) strcpy(msg, "[실패] ID 없음");
+             } else {
+                while(cur) {
+                    if(strcmp(cur->name, pin)==0 && (cmd==12 || cur->is_expired)) {
+                        Product* t=cur; if(!prev) head=cur->next; else prev->next=cur->next;
+                        cur=cur->next; free(t); d++;
+                    } else { prev=cur; cur=cur->next; }
+                }
+                snprintf(msg, sizeof(msg), "[삭제] %d개 삭제 완료", d); save_data(); update_log(msg);
+             }
         }
 
         pthread_mutex_unlock(&list_mutex);
-        snprintf(pout, sizeof(pout), "%d|%.8000s", out_p, msg);
+        snprintf(pout, sizeof(pout), "%d|%.8100s", out_p, msg);
         res.code = htonl(200); res.length = htonl(strlen(pout));
         send_exact(sock, &res, sizeof(NetHeader));
         send_exact(sock, pout, strlen(pout));
@@ -325,49 +458,215 @@ void* client_handler(void* socket_desc) {
     close(sock); return NULL;
 }
 
+/* ==========================================
+   스레드: 관리자 입력 및 모니터링
+   ========================================== */
+
+void* admin_console_thread(void* arg) {
+    char cmd[100];
+    
+    // 첫 프롬프트 위치 고정 (9 + DASHBOARD_LOGS = 24행)
+    pthread_mutex_lock(&screen_mutex);
+    printf("\033[%d;1H\033[K >> ", 9 + DASHBOARD_LOGS); 
+    fflush(stdout);
+    pthread_mutex_unlock(&screen_mutex);
+
+    while(1) {
+        if (fgets(cmd, sizeof(cmd), stdin)) {
+            cmd[strcspn(cmd, "\n")] = 0; 
+            
+            // 엔터 입력 후 프롬프트 위치 즉시 정리
+            pthread_mutex_lock(&screen_mutex);
+            printf("\033[%d;1H\033[J >> ", 9 + DASHBOARD_LOGS);
+            fflush(stdout);
+            pthread_mutex_unlock(&screen_mutex);
+
+            if (strcmp(cmd, "exit") == 0) handle_sigint(0);
+
+            if (strncmp(cmd, "log", 3) == 0) {
+                is_browsing_log = 1;
+                usleep(50000); 
+
+                int page = 1;
+                sscanf(cmd, "log %d", &page);
+                int items_per_page = 15;
+                
+                while(1) {
+                    pthread_mutex_lock(&screen_mutex);
+                    printf("\033[2J\033[1;1H"); // 로그 화면은 기본 clear 후 출력
+
+                    pthread_mutex_lock(&log_mutex);
+                    int total_pages = (total_logs + items_per_page - 1) / items_per_page;
+                    if (total_pages == 0) total_pages = 1;
+                    if (page < 1) page = 1;
+                    if (page > total_pages) page = total_pages;
+
+                    printf(" ========================================================================\n");
+                    printf("        서버 전체 로그 기록 (페이지 %d / %d)\n", page, total_pages);
+                    printf(" ========================================================================\n");
+                    
+                    if (total_logs == 0) {
+                        printf("  기록된 로그가 없습니다.\n");
+                    } else {
+                        int start = (page - 1) * items_per_page;
+                        int end = start + items_per_page;
+                        if (end > total_logs) end = total_logs;
+                        
+                        for (int i = start; i < end; i++) {
+                            int idx = (log_head - 1 - i + MAX_HISTORY) % MAX_HISTORY;
+                            if(idx < 0) idx += MAX_HISTORY;
+                            printf("  %d. %s\n", total_logs - i, log_history[idx]);
+                        }
+                    }
+                    pthread_mutex_unlock(&log_mutex);
+
+                    printf(" ------------------------------------------------------------------------\n");
+                    printf(" [0: 닫기 / 숫자: 해당 페이지 이동] >> ");
+                    fflush(stdout);
+                    pthread_mutex_unlock(&screen_mutex);
+                    
+                    char log_cmd[20];
+                    if(fgets(log_cmd, sizeof(log_cmd), stdin)) {
+                        log_cmd[strcspn(log_cmd, "\n")] = 0;
+                        if (strcmp(log_cmd, "0") == 0) break;
+                        int p = atoi(log_cmd);
+                        if (p > 0 && p <= total_pages) page = p;
+                    }
+                }
+                
+                is_browsing_log = 0;
+                pthread_mutex_lock(&screen_mutex);
+                printf("\033[2J\033[1;1H"); // 화면 정리
+                pthread_mutex_unlock(&screen_mutex);
+                
+                // 복귀 시 즉시 화면 한 번 그려주기
+                time_t vt = get_virtual_time();
+                char time_str[26]; print_time_str(vt, time_str);
+                draw_dashboard(time_str);
+
+                pthread_mutex_lock(&screen_mutex);
+                printf("\033[%d;1H\033[K >> ", 9 + DASHBOARD_LOGS);
+                fflush(stdout);
+                pthread_mutex_unlock(&screen_mutex);
+                continue; 
+            }
+
+            if (server_mode == 2) { 
+                if (strcmp(cmd, "reset") == 0) {
+                    pthread_mutex_lock(&list_mutex);
+                    free_all_resources(); remove(db_filename);
+                    time(&start_real_time); start_virtual_time = start_real_time;
+                    speed_factor = 1; 
+                    pthread_mutex_unlock(&list_mutex);
+                    update_log("[초기화] 데이터 및 세팅 리셋 완료 (1배속)");
+                }
+                else if (strcmp(cmd, "clearlog") == 0) {
+                    clear_persistent_logs();
+                }
+                else if (strcmp(cmd, "stop") == 0) { show_clock = 0; update_log("[제어] 시계 멈춤"); }
+                else if (strcmp(cmd, "start") == 0) { show_clock = 1; update_log("[제어] 시계 재개"); }
+                else if (strncmp(cmd, "speed", 5) == 0) {
+                    int new_spd;
+                    if (sscanf(cmd, "speed %d", &new_spd) == 1 && new_spd > 0) {
+                        time_t now; time(&now);
+                        start_virtual_time = start_virtual_time + (time_t)(difftime(now, start_real_time) * speed_factor);
+                        start_real_time = now;
+                        speed_factor = new_spd;
+                        char buf[100]; snprintf(buf, sizeof(buf), "[설정] 배속 x%d 적용", speed_factor);
+                        update_log(buf);
+                        save_config(); 
+                    } else {
+                        update_log("[오류] 사용법: speed 360");
+                    }
+                }
+            } 
+        }
+    }
+    return NULL;
+}
+
 void* monitor_thread(void* arg) {
     while(1) {
         time_t vt = get_virtual_time();
-        char time_str[26];
-        print_time_str(vt, time_str);
+        char time_str[26]; print_time_str(vt, time_str);
 
-        // [추가] 서버 터미널에 현재 가상 시간을 계속 출력 (확인용)
-        printf("\r[Virtual Time] %s (Speed: x%d)", time_str, SPEED_FACTOR);
-        fflush(stdout);
+        draw_dashboard(time_str);
 
         pthread_mutex_lock(&list_mutex);
         int ch = 0;
         for(Product* c = head; c; c = c->next) {
             if(!c->is_expired && c->expire_time < vt) { 
-                c->is_expired = 1; 
-                ch = 1; 
-                printf("\n[System] 상품 만료 발생: [%s] %s\n", c->id, c->name);
+                c->is_expired = 1; ch = 1; 
+                char buf[256]; snprintf(buf, sizeof(buf), "[만료 발생] %s", c->name);
+                update_log(buf); 
             }
         }
-        if(ch) save_data();
+        if(ch) save_data(); 
         pthread_mutex_unlock(&list_mutex);
         
-        usleep(1000000); // 1초마다 갱신
+        usleep(500000); 
     }
 }
 
-int main() {
-    int s_sock, c_sock; struct sockaddr_in s_addr, c_addr; socklen_t len = sizeof(c_addr);
-    srand(time(NULL)); pthread_mutex_init(&list_mutex, NULL);
-    time(&start_real_time); start_virtual_time = start_real_time;
-    load_data(); signal(SIGINT, handle_sigint);
-    pthread_t m_tid; pthread_create(&m_tid, NULL, monitor_thread, NULL);
+/* ==========================================
+   메인 함수
+   ========================================== */
 
+int main() {
+    printf("\033[2J\033[1;1H");
+    printf("======================================\n");
+    printf("    스마트 재고 관리 서버 (Server)    \n");
+    printf("======================================\n");
+    printf("1. 운영 모드 (Operation)\n");
+    printf("2. 시뮬레이션 모드 (Simulation)\n");
+    printf("--------------------------------------\n");
+    printf("선택 >> ");
+    
+    if (scanf("%d", &server_mode) != 1) server_mode = 1;
+    getchar(); 
+
+    if (server_mode == 2) {
+        strcpy(db_filename, "sim_db.txt");
+        speed_factor = 1; 
+    } else {
+        server_mode = 1; speed_factor = 1;
+        strcpy(db_filename, "oper_db.txt");
+    }
+
+    srand(time(NULL)); 
+    pthread_mutex_init(&list_mutex, NULL);
+    pthread_mutex_init(&log_mutex, NULL);
+    pthread_mutex_init(&screen_mutex, NULL);
+
+    time(&start_real_time); 
+    start_virtual_time = start_real_time;
+    
+    load_persistent_logs(); 
+    load_data(); 
+    load_config(); 
+
+    printf("\033[2J\033[1;1H"); 
+    signal(SIGINT, handle_sigint);
+
+    pthread_t m_tid, a_tid;
+    pthread_create(&m_tid, NULL, monitor_thread, NULL);
+    pthread_create(&a_tid, NULL, admin_console_thread, NULL);
+
+    int s_sock, c_sock; struct sockaddr_in s_addr, c_addr; socklen_t len = sizeof(c_addr);
     s_sock = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1; setsockopt(s_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     s_addr.sin_family = AF_INET; s_addr.sin_addr.s_addr = INADDR_ANY; s_addr.sin_port = htons(PORT);
     bind(s_sock, (struct sockaddr *)&s_addr, sizeof(s_addr));
     listen(s_sock, 10);
-    printf("=== 스마트 재고 서버 가동 (Port: %d) ===\n", PORT);
 
     while((c_sock = accept(s_sock, (struct sockaddr *)&c_addr, &len))) {
         int* n_sock = malloc(sizeof(int));
-        if(n_sock) { *n_sock = c_sock; pthread_t c_tid; pthread_create(&c_tid, NULL, client_handler, n_sock); pthread_detach(c_tid); }
+        if(n_sock) { 
+            *n_sock = c_sock; 
+            pthread_t c_tid; 
+            pthread_create(&c_tid, NULL, client_handler, n_sock); 
+            pthread_detach(c_tid); 
+        }
     }
     return 0;
 }
